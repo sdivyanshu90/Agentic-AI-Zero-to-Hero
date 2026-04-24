@@ -25,7 +25,7 @@ Every module pairs a detailed markdown lesson with four Python files you can rea
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/agentic-ai-zero-to-hero.git
+git clone https://github.com/sdivyanshu90/agentic-ai-zero-to-hero.git
 cd agentic-ai-zero-to-hero
 
 # 2. Create and activate a virtual environment
@@ -210,5 +210,3 @@ All 25 modules OK.
 
 - Every module includes pinned dependencies in code blocks, a pytest-style eval harness, and explicit security analysis.
 - The repository is markdown-first by design, but each lesson now stores its executable code in a sibling directory named after the module file stem.
-- Use `python3 tools/verify_lesson_artifacts.py` to verify the extracted artifacts, lesson links, and markdown structure across all 25 modules.
-- The extracted artifacts are meant to be inspected and executed directly, while the markdown focuses on explaining the code path in phase order.
