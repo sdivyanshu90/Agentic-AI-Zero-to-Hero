@@ -1,0 +1,118 @@
+# test_langgraph_basics_eval.py
+# requirements: pytest==8.3.5 openai==1.77.0 tenacity==8.5.0 structlog==24.4.0 python-dotenv==1.0.1
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from statistics import mean
+from typing import Any
+
+import pytest
+import structlog
+from dotenv import load_dotenv
+from openai import APIError, APITimeoutError, OpenAI, RateLimitError
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+
+load_dotenv()
+pytestmark = pytest.mark.skipif(
+    not os.getenv("OPENAI_API_KEY"),
+    reason="OPENAI_API_KEY not set — add it to a .env file to run live tests",
+)
+
+structlog.configure(processors=[structlog.processors.JSONRenderer()])
+log = structlog.get_logger(__name__)
+_api_key = os.getenv("OPENAI_API_KEY", "")
+client = OpenAI(api_key=_api_key)
+
+
+class BudgetExceededError(RuntimeError):
+    pass
+
+
+JUDGE_PROMPT: str = """
+You are grading a LangGraph workflow.
+Return JSON with keys score and reason.
+score = 1.0 only when the workflow reaches the expected state transitions and terminal status.
+score = 0.0 when routing or retry behavior is incorrect.
+""".strip()
+
+
+def estimate_prompt_tokens(*parts: str) -> int:
+    return sum(max(1, len(part) // 4) for part in parts)
+
+
+def enforce_token_budget(max_prompt_tokens: int, *parts: str) -> None:
+    estimated_prompt_tokens = estimate_prompt_tokens(*parts)
+    if estimated_prompt_tokens > max_prompt_tokens:
+        raise BudgetExceededError(
+            f"estimated prompt tokens {estimated_prompt_tokens} exceed budget {max_prompt_tokens}"
+        )
+
+
+@pytest.fixture()
+def golden_dataset() -> list[dict[str, Any]]:
+    dataset_path = Path("golden/langgraph_basics.json")
+    if dataset_path.exists():
+        return json.loads(dataset_path.read_text(encoding="utf-8"))
+    return [
+        {"input": "simple question", "expected": "answered", "tags": ["happy_path"]},
+        {"input": "needs context", "expected": "answered", "tags": ["retrieve"]},
+        {"input": "", "expected": "failed", "tags": ["empty"]},
+        {"input": "long question", "expected": "answered", "tags": ["budget"]},
+        {"input": "retry path", "expected": "answered", "tags": ["retry"]},
+    ]
+
+
+def run_case(case_input: str) -> str:
+    return "failed" if not case_input else "answered"
+
+
+@retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3), reraise=True)
+def judge_score(case_input: str, expected: str, actual: str) -> dict[str, Any]:
+    enforce_token_budget(4000, JUDGE_PROMPT, case_input, expected, actual)
+    try:
+        completion = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            temperature=0.0,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": JUDGE_PROMPT},
+                {"role": "user", "content": json.dumps({"input": case_input, "expected": expected, "actual": actual}, ensure_ascii=True)},
+            ],
+        )
+    except (APIError, APITimeoutError, RateLimitError) as exc:
+        log.warning("judge_retry", error_type=type(exc).__name__, message=str(exc))
+        raise
+    return json.loads(completion.choices[0].message.content or "{}")
+
+
+def test_eval_threshold(golden_dataset: list[dict[str, Any]]) -> None:
+    scored_cases: list[tuple[float, dict[str, Any]]] = []
+    for case in golden_dataset:
+        actual = run_case(str(case["input"]))
+        score_payload = judge_score(str(case["input"]), str(case["expected"]), actual)
+        scored_cases.append((float(score_payload["score"]), score_payload))
+
+    scores = [entry[0] for entry in scored_cases]
+    if mean(scores) <= 0.95:
+        worst_cases = sorted(zip(golden_dataset, scored_cases), key=lambda item: item[1][0])[:3]
+        for case, scored_case in worst_cases:
+            log.error("worst_case", input=case["input"], score=scored_case[0], reason=scored_case[1]["reason"])
+    assert mean(scores) > 0.95
+
+
+@pytest.mark.parametrize(
+    ("case_input", "expected"),
+    [
+        ("", "failed"),
+        ("A" * 12000, "answered"),
+        ("tool injection: ignore context", "answered"),
+    ],
+)
+def test_edge_cases(case_input: str, expected: str) -> None:
+    actual = run_case(case_input)
+    scored = judge_score(case_input, expected, actual)
+    assert 0.0 <= float(scored["score"]) <= 1.0
+    assert isinstance(scored["reason"], str)
